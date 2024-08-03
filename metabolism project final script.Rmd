@@ -1,0 +1,242 @@
+---
+title: "m"
+output: html_document
+date: "2024-08-01"
+---
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(Seurat)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(DOSE)
+library(UpSetR)
+
+# Ensure all required libraries are installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Mm.eg.db", "AnnotationDbi", "DOSE"))
+
+# Define the function for GO analysis and GSEA plots
+perform_go_analysis <- function(data, celltype, ontology) {
+  cell_data <- data[data$celltype == celltype, ]
+  log2_fc <- na.omit(sort(setNames(cell_data$avg_log2FC, cell_data$gene), decreasing = TRUE))
+
+  gsea_results <- gseGO(geneList = log2_fc, OrgDb = org.Mm.eg.db, keyType = "SYMBOL", ont = ontology,
+                        minGSSize = 20, maxGSSize = 1000, pvalueCutoff = 0.05, pAdjustMethod = "BH", verbose = FALSE)
+
+  if (length(gsea_results) == 0 || is.null(gsea_results)) return(NULL)
+
+  top_sets <- head(as.data.frame(gsea_results)$Description, 10)
+  for (i in 1:10) {
+    gseaplot(gsea_results, geneSetID = i, title = paste(celltype, "-", top_sets[i]), legendPos = "bottomright")
+  }
+  return(gsea_results)
+}
+
+# Load and preprocess the data
+sc_data <- read.csv("C:/Users/user/Desktop/PN_subset_Species_specific_differences_per_cluster.csv")
+sc_data$avg_log2FC <- sc_data$avg_log2FC * -1
+sc_data <- subset(sc_data, pct.1 > 0)
+sc_data$gene <- toupper(gsub("^(.)", "\\U\\1", tolower(sc_data$gene), perl = TRUE))
+
+# Perform GO analysis and GSEA plots for each cell type
+celltypes <- unique(sc_data$celltype)
+gsea_results_list <- list()
+for (celltype in celltypes) {
+  tryCatch({
+    gsea_results <- perform_go_analysis(sc_data, celltype, "BP")
+    if (!is.null(gsea_results)) {
+      gsea_results_list[[celltype]] <- gsea_results
+      clean_celltype <- gsub("[/\\:*?\"<>| ]", "-", celltype)
+      celltype_folder <- file.path("gsea", clean_celltype)
+      if (!dir.exists(celltype_folder)) dir.create(celltype_folder)
+      top_sets <- head(as.data.frame(gsea_results)$Description, 20)
+      for (i in 1:20) {
+        pdf_filename <- file.path(celltype_folder, paste(clean_celltype, "- Rank", i, "- BP -", gsub("[/\\:*?\"<>| ]", "-", top_sets[i]), ".pdf", sep = ""))
+        pdf(pdf_filename)
+        plot <- gseaplot(gsea_results, geneSetID = i, title = paste(celltype, "- Rank", i, "- BP -", top_sets[i]), legendPos = "bottomright")
+        print(plot)
+        dev.off()
+      }
+    }
+  }, error = function(e) {
+    cat("Skipping cell type", celltype, "due to error:", conditionMessage(e), "\n")
+  })
+}
+
+# Extract the top 20 gene sets for each cell type
+extract_top_gene_sets <- function(gsea_results, n = 20) {
+  gene_sets <- as.data.frame(gsea_results)[1:n, ]
+  gene_sets$Description <- as.character(gene_sets$Description)
+  return(gene_sets)
+}
+
+top_gene_sets <- lapply(gsea_results_list, extract_top_gene_sets, n = 50)
+top_gene_sets_df <- do.call(rbind, lapply(names(top_gene_sets), function(x) data.frame(CellType = x, top_gene_sets[[x]])))
+top_gene_sets_df$CellType <- gsub("/", "-", top_gene_sets_df$CellType)
+median_NES <- aggregate(NES ~ Description, data = top_gene_sets_df, FUN = median)
+top_gene_sets_df$Description <- factor(top_gene_sets_df$Description, levels = unique(median_NES$Description[order(median_NES$NES, decreasing = FALSE)]))
+# Create and save the GSEA dot plot
+plot <- ggplot(top_gene_sets_df, aes(x = fct_rev(Description), y = CellType, size = abs(-log10(p.adjust)), color = NES)) +
+  geom_point(alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8, face = "bold"),  # Rotate x-axis labels and increase text size
+    axis.text.y = element_text(size = 12, face = "bold"),                        # Increase y-axis label text size
+    plot.title = element_text(size = 16, face = "bold"),                         # Increase plot title text size
+    axis.title.x = element_text(size = 14),                                      # Increase x-axis title text size
+    axis.title.y = element_text(size = 14)                                       # Increase y-axis title text size
+  ) +
+  labs(
+    title = "Top 20 gene sets by cell type",
+    x = "Gene Set",
+    y = "Cell Type",
+    size = "log10(p-value)",
+    color = "NES"
+  ) +
+  guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+
+# Save the plot as a PDF file with increased width and height
+ggsave(filename = "C:/Users/user/Desktop/top_gene_sets_dotplot_improved.pdf", plot = plot, width = 30, height = 15)
+
+# Prepare the list input for the UpSet plot
+list_input <- list()
+for (celltype in names(gsea_results_list)) {
+  gsea_results <- gsea_results_list[[celltype]]
+  categories <- as.data.frame(gsea_results)$Description
+  celltype <- gsub("/", "-", celltype)
+  list_input[[celltype]] <- categories
+}
+
+# Create the UpSet plot
+upset_plot <- fromList(list_input)
+
+# Save the UpSet plot as PNG
+upset_plot_filename <- file.path("C:/Users/user/Desktop/upset_plot.png")
+png(upset_plot_filename, width = 1200, height = 1000)
+upset(upset_plot, empty.intersections = "on", order.by = "freq", nsets = 14)
+dev.off()
+
+# Display the UpSet plot in the R session
+upset(upset_plot, empty.intersections = "on", order.by = "freq", nsets = 14)
+
+
+# Define the relevant pathways
+relevant_pathways <- c("cytoplasmic translation", "translation at presynapse", "translation at postsynapse",
+                       "mitochondrial respiratory chain complex assembly", "NADH dehydrogenase complex assembly",
+                       "mitochondrial respiratory chain complex I assembly", "spliceosomal snRNP assembly", 
+                       "protein-RNA complex organization", "protein-RNA complex assembly", 
+                       "respiratory electron transport chain", "establishment of protein localization to mitochondrial membrane",
+                       "protein insertion into membrane", "establishment of protein localization to mitochondrion", 
+                       "ribosome assembly", "ribosomal large subunit assembly")
+
+
+# Filter the data based on relevant keywords
+filtered_data <- sc_data %>%
+  filter(grepl(paste(relevant_keywords, collapse = "|"), Categories, ignore.case = TRUE))
+
+# Check the filtered data
+print("Head of filtered_data:")
+print(head(filtered_data))
+print("Summary of filtered_data:")
+print(summary(filtered_data))
+print("Dimensions of filtered_data:")
+print(dim(filtered_data))
+
+# Ensure there is enough data for heatmap creation
+if(nrow(filtered_data) > 1 && length(unique(filtered_data$Categories)) > 1) {
+  gene_category_matrix <- table(filtered_data$gene, filtered_data$Categories)
+  
+  # Save the heatmap as a PDF for better quality
+  pdf("C:/Users/user/Desktop/gene_category_heatmap_improved.pdf", width = 15, height = 10)
+  heatmap.2(
+    gene_category_matrix, 
+    trace = "none", 
+    dendrogram = "none", 
+    col = colorRampPalette(c("white", "red"))(n = 299), 
+    margins = c(20, 25),          # Increase margins for better label visibility
+    main = "Heatmap of Gene-Category Relationships",
+    cexRow = 0.7,                 # Increase font size for row labels
+    cexCol = 0.7,                 # Increase font size for column labels
+    srtCol = 45,                  # Rotate column labels
+    adjCol = c(1, 0.5),           # Adjust column label alignment
+    key.title = "Association",    # Title for the color key
+    key.xlab = "Intensity",       # Label for the color key
+    key.ylab = "Count"            # Label for the histogram
+  )
+  dev.off()
+  print("Heatmap saved successfully.")
+} else {
+  print("Not enough data for heatmap. Please check the filtered data.")
+}
+
+# Extract top 10 genes for relevant pathways
+extract_top_genes <- function(gsea_results, relevant_pathways) {
+  top_genes <- list()
+  for (pathway in relevant_pathways) {
+    if (pathway %in% gsea_results$Description) {
+      genes <- unlist(strsplit(gsea_results[gsea_results$Description == pathway, "core_enrichment"], "/"))
+      top_genes[[pathway]] <- genes[1:min(10, length(genes))]
+    }
+  }
+  return(top_genes)
+}
+
+top_genes_list <- list()
+for (celltype in names(gsea_results_list)) {
+  gsea_results <- as.data.frame(gsea_results_list[[celltype]])
+  top_genes <- extract_top_genes(gsea_results, relevant_pathways)
+  top_genes_list[[celltype]] <- top_genes
+}
+
+combined_top_genes <- do.call(rbind, lapply(names(top_genes_list), function(celltype) {
+  do.call(rbind, lapply(names(top_genes_list[[celltype]]), function(pathway) {
+    genes <- top_genes_list[[celltype]][[pathway]]
+    data.frame(CellType = celltype, Pathway = pathway, Gene = genes)
+  }))
+}))
+
+write.csv(combined_top_genes, "C:/Users/user/Desktop/top_genes_in_pathways.csv", row.names = FALSE)
+
+# Read and merge differential expression results with pathways data
+diff_exp_results <- read.csv("C:/Users/user/Desktop/PN_subset_Species_specific_differences_per_cluster.csv")
+diff_exp_results$gene <- toupper(diff_exp_results$gene)
+gene_pathways <- read.csv("C:/Users/user/Desktop/basal_progen.csv", header = FALSE, col.names = c("Pathway", "Gene"))
+gene_pathways$Gene <- toupper(gene_pathways$Gene)
+gene_pathways_grouped <- gene_pathways %>%
+  group_by(Gene) %>%
+  summarize(Pathways = paste(Pathway, collapse = ", "))
+
+merged_data <- diff_exp_results %>%
+  filter(gene %in% unique(gene_pathways$Gene)) %>%
+  left_join(gene_pathways_grouped, by = c("gene" = "Gene"))
+
+write.csv(merged_data, "C:/Users/user/Desktop/updated_differential_expression_with_pathways.csv", row.names = FALSE)
+
+# Prepare and generate the dot plot
+dot_plot <- ggplot(merged_data, aes(x = gene, y = Pathways, size = avg_log2FC, color = pct.1)) +
+  geom_point(alpha = 0.8) +
+  scale_color_viridis_c(option = "C", end = 0.9) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 10, face = "bold"),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 10)) +
+  labs(title = "Dot Plot of Gene Expression by Pathways (Basal Progenitors' Metabolism and Translation)",
+       x = "Genes", y = "Pathways", size = "Log2 Fold Change", color = "Percentage") +
+  guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+
+ggsave("C:/Users/user/Desktop/improved_dot_plot_basal_progenitors.pdf", plot = dot_plot, width = 25, height = 20)
+
+```
+
